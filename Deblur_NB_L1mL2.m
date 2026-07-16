@@ -1,213 +1,185 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%This function solves the following nonconvex variant of the Mumford-Shah
-%model with AITV regularization:
+%This function solves the following nonconvex variant with AITV regularization
+%and nonnegative constraint via ADMM:
 %
-%   min \langle (R + f) log(R + Au) - f log Au \rangle +
-%   beta \|\nabla u\|_1 - \alpha \|\nabla u\|_{2,1}
+%   min <(R + g) log(R + v) - g log v, 1> +
+%       tau (||w||_1 - alpha ||w||_{2,1}) + I_{>=0}(f)
+%   s.t. Au = v, Du = w, f = u
 %
 %Input:
-%   f: noisy image
-%   A: deblurring operator
-%   beta: weighing parameter for fidelity term
-%   alpha: sparsity parameter for L1-\alpha L2 term of gradient
-%   tau: penalty parameter for ADMM
-%   mu: weighing parameter for smoothing term (% In this paper, mu = 0.)
+%   g: noisy image
+%   A: blurring operator
+%   alpha: sparsity parameter for L1-alpha L2 term of gradient
+%   tau: regularization parameter tau in the paper
+%   beta: initial ADMM penalty parameter beta^0 in the paper
+%   r: negative binomial parameter
 %
 %Output:
-%   u: solution/smoothed image
+%   f_sol: solution/recovered image (nonnegative)
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-function [u]= Deblur_NB_L1mL2(f, A, mu, alpha, beta, tau, r)
-    
-    %penalty parameter multiplier
-    rho = 1.1;
-    %tau = 0.1;
-    
-    %obtain dimension of image
-    [rows,cols] = size(f);
-    
-    %preintialize variable to store past u
-    u0 = ones(rows,cols);
-    
-    %preinitialize u
-    u= u0;
+function [f_sol] = Deblur_NB_L1mL2(g, A, alpha, tau, beta, r)
 
-    %preinitialize v
-    v=u0;
-    
-    %preinitialize w variables
+    % penalty parameter multiplier (sigma in the paper)
+    rho = 1.1;
+
+    % max iterations (K in the paper)
+    K = 300;
+
+    % obtain dimension of image
+    [rows, cols] = size(g);
+
+    % preinitialize variables
+    u0 = ones(rows, cols);
+    u  = u0;
+    f  = zeros(rows,cols);
+    v  = u0;
     wx = u0;
     wy = u0;
-    
-    %preinitialize dual variable
-    z = v;
-    zx = u0;
-    zy = u0;
-    
-    %build kernel: use the fft algorithm (5-pt stencil)
-    uker = zeros(rows,cols);
-    uker(1,1) = 4;uker(1,2)=-1;uker(2,1)=-1;uker(rows,1)=-1;uker(1,cols)=-1;
-    
-    %refit blurring operator and shift it
+
+    % preinitialize dual variables
+    x  = ones(rows, cols);    % dual for Au = v
+    yx = ones(rows, cols);    % dual for Dx(u) = wx
+    yy = ones(rows, cols);    % dual for Dy(u) = wy
+    z  = ones(rows, cols);    % dual for f = u
+
+    % build kernel: use the fft algorithm (5-pt stencil)
+    uker = zeros(rows, cols);
+    uker(1,1) = 4; uker(1,2) = -1; uker(2,1) = -1; uker(rows,1) = -1; uker(1,cols) = -1;
+
+    % refit blurring operator and shift it
     [xLen_flt, yLen_flt] = size(A);
-    ope_blur=zeros(rows,cols);
-    ope_blur(1:xLen_flt,1:yLen_flt)=A;
-    
-    xLen_flt_1=floor(xLen_flt/2);yLen_flt_1=floor(yLen_flt/2);
-    ope_blur_1=padarray(ope_blur,[rows,cols],'circular','pre');
-    ope_blur_1=ope_blur_1(xLen_flt_1+1:rows+xLen_flt_1,yLen_flt_1+1:cols+yLen_flt_1);
-    
-    %fourier transform of blurring operator
+    ope_blur = zeros(rows, cols);
+    ope_blur(1:xLen_flt, 1:yLen_flt) = A;
+
+    xLen_flt_1 = floor(xLen_flt/2); yLen_flt_1 = floor(yLen_flt/2);
+    ope_blur_1 = padarray(ope_blur, [rows, cols], 'circular', 'pre');
+    ope_blur_1 = ope_blur_1(xLen_flt_1+1:rows+xLen_flt_1, yLen_flt_1+1:cols+yLen_flt_1);
+
+    % Fourier transform of blurring operator
     FA = fft2(ope_blur_1);
 
-    %compute Au
-    Au = ifft2(FA.*fft2(u));
-    
-    for i=1:300
+    % ADMM penalty parameter
+    admm_beta = beta;  % beta^0 in the paper
 
- %store past u
-        u0 = u;
-        
-        %left-hand side of optimality eqn of u
-        new_uker = beta*conj(FA).*FA+(mu+beta)*fft2(uker);
-        
-        %right-hand side of optimality eqn of u
-        rhs1 = beta*v-z;
-        rhs2 = beta*Dxt(wx)-Dxt(zx)+beta*Dyt(wy)-Dyt(zy);
-        
-        %solve u-subproblem
-        u = ifft2((conj(FA).*fft2(rhs1)+fft2(rhs2))./new_uker);
+    for k = 1:K
 
-        %compute Au
-        Au = ifft2(FA.*fft2(u));
-        
-        %compute relative err
-        err=norm(u-u0,'fro')/norm(u, 'fro');
-        
-        % if mod(i,10)==0
-        %     disp(['iterations: ' num2str(i) '!  ' 'error is:   ' num2str(err)]);
-        % end
-        
-        % check the stopping criterion
-        if err<10^(-4)
-            break;
-        end
+        % store past f for stopping criterion
+        f_old = f;
 
+        %----- f-subproblem (nonneg projection) -----
+        % f^{k+1} = max(u^k - z^k / beta^k, 0)
+        f = max(u - z / admm_beta, 0);
 
-        %solve v-subproblem beta=delta;x=z;Au=u
-        delta=beta;
-        c3 = delta; %coefficient of order 3
-        c2 = delta * r - delta * Au - z; %coefficient of order 2, r is the NB parameter,
-        c1 = -delta * Au * r - r * z +  (1/tau)*r; %coefficient of order 1
-        c0 = -f * r * (1/tau);
-        
+        %----- u-subproblem (FFT solve) -----
+        % Normal equation: beta*(A'A + D'D + I) u = A'(beta*v - x) - D'(y - beta*w) + beta*f^{k+1} + z
+        lhs_ker = admm_beta * conj(FA).*FA + admm_beta * fft2(uker) + admm_beta;
+
+        rhs1 = conj(FA) .* fft2(admm_beta * v - x);
+        rhs2 = admm_beta * Dxt(wx) - Dxt(yx) + admm_beta * Dyt(wy) - Dyt(yy);
+        rhs3 = admm_beta * f + z;
+
+        u = real(ifft2((rhs1 + fft2(rhs2) + fft2(rhs3)) ./ lhs_ker));
+
+        % compute Au
+        Au = real(ifft2(FA .* fft2(u)));
+
+        %----- v-subproblem (cubic root) -----
+        delta = admm_beta;
+        c3 = delta;
+        c2 = delta * r - delta * Au - x;
+        c1 = -delta * Au * r - r * x + r;
+        c0 = -g * r;
 
         a2 = c2 / c3;
         a1 = c1 / c3;
         a0 = c0 / c3;
 
         Q = (3 * a1 - a2 .^ 2) / 9;
-        R = (9 * a2.*a1 - 27* a0 - 2* a2.^ 3) / 54;
-        D = Q.^ 3 + R.^ 2;
+        R_cubic = (9 * a2.*a1 - 27 * a0 - 2 * a2.^3) / 54;
+        D = Q.^3 + R_cubic.^2;
 
-
-        S_tem1 = R + sqrt(D);
+        S_tem1 = R_cubic + sqrt(D);
         S_tem2 = S_tem1;
-        S_tem2(imag(S_tem2)==0) = 0; %set all real component = 0
-        S_tem1(imag(S_tem1)~=0) = 0; %set all complex componet = 0
-        S = nthroot(S_tem1,3) + S_tem2.^(1/3);
+        S_tem2(imag(S_tem2) == 0) = 0;
+        S_tem1(imag(S_tem1) ~= 0) = 0;
+        S = nthroot(S_tem1, 3) + S_tem2.^(1/3);
 
-
-        T_tem1 = R - sqrt(D);
+        T_tem1 = R_cubic - sqrt(D);
         T_tem2 = T_tem1;
-        T_tem2(imag(T_tem2)==0) = 0; %set all real component = 0
-        T_tem1(imag(T_tem1)~=0) = 0; %set all complex componet = 0
-        T = nthroot(T_tem1,3) + T_tem2.^(1/3);
+        T_tem2(imag(T_tem2) == 0) = 0;
+        T_tem1(imag(T_tem1) ~= 0) = 0;
+        T = nthroot(T_tem1, 3) + T_tem2.^(1/3);
 
-        % %three solutions
-        v1 = -1/3 * a2 + (S + T); %always postive real
-        v2 = -1/3 * a2 - (S + T)/2 + 1i/2 * sqrt(3) *(S - T);
-        v3 = -1/3 * a2 - (S + T)/2 - 1i/2 * sqrt(3) *(S - T);
-
+        v1 = -1/3 * a2 + (S + T);
+        v2 = -1/3 * a2 - (S + T)/2 + 1i/2 * sqrt(3) * (S - T);
+        v3 = -1/3 * a2 - (S + T)/2 - 1i/2 * sqrt(3) * (S - T);
 
         if isreal(v2)
-            v1(v1<0) = 10e-6;
-            v2(v2<0) = 10e-6;
-            v3(v3<0) = 10e-6;
+            v1(v1 < 0) = 10e-6;
+            v2(v2 < 0) = 10e-6;
+            v3(v3 < 0) = 10e-6;
 
-            val1 = sum((r+f).*log(r+v1) - f.*log(v1)) + z .* (Au-v1) + delta/2 * (Au-v1).^2;
-            val2 = sum((r+f).*log(r+v2) - f.*log(v2)) + z .* (Au-v2) + delta/2 * (Au-v2).^2;
-            val3 = sum((r+f).*log(r+v3) - f.*log(v3)) + z .* (Au-v3) + delta/2 * (Au-v3).^2;
+            val1 = (r+g).*log(r+v1) - g.*log(v1) - x.*v1 + delta/2 * (Au-v1).^2;
+            val2 = (r+g).*log(r+v2) - g.*log(v2) - x.*v2 + delta/2 * (Au-v2).^2;
+            val3 = (r+g).*log(r+v3) - g.*log(v3) - x.*v3 + delta/2 * (Au-v3).^2;
 
-            v1(val1>val2) = 0;
-            v1(val1>val3) = 0;
+            v1(val1 > val2) = 0;
+            v1(val1 > val3) = 0;
+            v2(val2 > val3) = 0;
+            v2(val2 > val1) = 0;
+            v3(val3 > val1) = 0;
+            v3(val3 > val2) = 0;
 
-            v2(val2>val3) = 0;
-            v2(val2>val1) = 0;
-
-            v3(val3>val1) = 0;
-            v3(val3>val2) = 0;
-
-            v = v1+v2+v3;
+            v = v1 + v2 + v3;
         else
             v = v1;
-        end 
+        end
 
-        
+        %----- w-subproblem (proximal operator) -----
+        temp1 = Dx(u) + yx / admm_beta;
+        temp2 = Dy(u) + yy / admm_beta;
 
-        %solve w-subproblem
-        temp1 = Dx(u)+zx/beta;
-        temp2 = Dy(u)+zy/beta;
-        
-        temp1 = reshape(temp1, rows*cols,1);
-        temp2 = reshape(temp2, rows*cols,1);
-        
+        temp1 = reshape(temp1, rows*cols, 1);
+        temp2 = reshape(temp2, rows*cols, 1);
+
         temp = [temp1, temp2];
-        temp = shrinkL12(temp,1/beta, alpha);
-        wx = temp(:,1);
-        wy = temp(:,2);
-        wx = reshape(wx, rows,cols);
-        wy = reshape(wy, rows,cols);
-        
-        %update dual variables
-        zx = zx+beta*(Dx(u)-wx);
-        zy = zy+beta*(Dy(u)-wy);
-        z = z+beta*(Au-v);
-        
-        %update ADMM penalty parameter
-        beta = beta*rho;
+        temp = shrinkL12(temp, tau/admm_beta, alpha);
+        wx = reshape(temp(:,1), rows, cols);
+        wy = reshape(temp(:,2), rows, cols);
+
+        %----- dual variable updates -----
+        x  = x  + admm_beta * (Au - v);           % dual for Au = v
+        yx = yx + admm_beta * (Dx(u) - wx);       % dual for Dx(u) = wx
+        yy = yy + admm_beta * (Dy(u) - wy);       % dual for Dy(u) = wy
+        z  = z  + admm_beta * (f - u);             % dual for f = u
+
+        %----- update ADMM penalty parameter -----
+        admm_beta = admm_beta * rho;
+
+        %----- stopping criterion -----
+        err = norm(f - f_old, 'fro') / norm(f, 'fro');
+        if err < 10^(-4)
+            break;
+        end
     end
 
+    f_sol = f;
 
 end
 
-function x = shrinkL12(y,lambda,alpha)
-    %this function applies the proximal operator of L1-alpha L2 to each
-    %row vector
-    
-    %initialize solution as zero vector
+function x = shrinkL12(y, lambda, alpha)
     x = zeros(size(y));
-    
-    %obtain the indices of the max entries of each row vector
+
     [max_y, idx_y] = max(abs(y'));
     max_y = max_y';
     idx_y = idx_y';
-    new_idx_y = sub2ind(size(y), (1:size(y,1))',idx_y);
-    
-    %compute new row vectors when max value of each row vector is greater
-    %than lambda
+    new_idx_y = sub2ind(size(y), (1:size(y,1))', idx_y);
+
     case1_idx = max_y > lambda;
-    
-    case1_result = max(abs(y(case1_idx,:))-lambda,0).*sign(y(case1_idx,:));
-    norm_case1_result = sqrt(sum(case1_result.^2,2));
-    x(case1_idx,:) =((norm_case1_result+alpha*lambda)./norm_case1_result).*case1_result;
-    
-    %compute one-sparse vector when max value of each row vector is less
-    %than or equal to lambda and above (1-alpha)*lambda
-    case2_idx = logical((max_y<=lambda).*(max_y>=(1-alpha)*lambda));
-    
-    x(new_idx_y(case2_idx)) = (max_y(case2_idx)+(alpha-1)*lambda).*sign(y(new_idx_y(case2_idx)));
-    
+    case1_result = max(abs(y(case1_idx,:)) - lambda, 0) .* sign(y(case1_idx,:));
+    norm_case1_result = sqrt(sum(case1_result.^2, 2));
+    x(case1_idx,:) = ((norm_case1_result + alpha*lambda) ./ norm_case1_result) .* case1_result;
+
+    case2_idx = logical((max_y <= lambda) .* (max_y >= (1-alpha)*lambda));
+    x(new_idx_y(case2_idx)) = (max_y(case2_idx) + (alpha-1)*lambda) .* sign(y(new_idx_y(case2_idx)));
 end
-
-
-    

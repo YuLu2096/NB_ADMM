@@ -99,16 +99,10 @@ function [f_sol] = Deblur_NB_L1mL2(g, A, alpha, tau, beta, r)
         D = Q.^3 + R_cubic.^2;
 
         S_tem1 = R_cubic + sqrt(D);
-        S_tem2 = S_tem1;
-        S_tem2(imag(S_tem2) == 0) = 0;
-        S_tem1(imag(S_tem1) ~= 0) = 0;
-        S = nthroot(S_tem1, 3) + S_tem2.^(1/3);
+        S = S_tem1.^(1/3);
 
         T_tem1 = R_cubic - sqrt(D);
-        T_tem2 = T_tem1;
-        T_tem2(imag(T_tem2) == 0) = 0;
-        T_tem1(imag(T_tem1) ~= 0) = 0;
-        T = nthroot(T_tem1, 3) + T_tem2.^(1/3);
+        T = T_tem1.^(1/3);
 
         v1 = -1/3 * a2 + (S + T);
         v2 = -1/3 * a2 - (S + T)/2 + 1i/2 * sqrt(3) * (S - T);

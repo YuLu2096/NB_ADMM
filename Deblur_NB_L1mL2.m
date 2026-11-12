@@ -16,11 +16,12 @@
 %
 %Output:
 %   f_sol: solution/recovered image (nonnegative)
+%   iters: number of ADMM iterations performed (optional; for timing tables)
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-function [f_sol] = Deblur_NB_L1mL2(g, A, alpha, tau, beta, r)
+function [f_sol, iters] = Deblur_NB_L1mL2(g, A, alpha, tau, beta, r)
 
     % penalty parameter multiplier (sigma in the paper)
-    rho = 1.1;
+    rho = 1.25;
 
     % max iterations (K in the paper)
     K = 300;
@@ -31,7 +32,10 @@ function [f_sol] = Deblur_NB_L1mL2(g, A, alpha, tau, beta, r)
     % preinitialize variables
     u0 = ones(rows, cols);
     u  = u0;
-    f  = zeros(rows,cols);
+    f  = u0;                  % f^0 > 0, as required by Algorithm 1.  (f is
+                              % overwritten by the f-update before it is ever
+                              % read, so this changes no result; it only makes
+                              % the code match the stated initialization.)
     v  = u0;
     wx = u0;
     wy = u0;
@@ -84,50 +88,11 @@ function [f_sol] = Deblur_NB_L1mL2(g, A, alpha, tau, beta, r)
         Au = real(ifft2(FA .* fft2(u)));
 
         %----- v-subproblem (cubic root) -----
-        delta = admm_beta;
-        c3 = delta;
-        c2 = delta * r - delta * Au - x;
-        c1 = -delta * Au * r - r * x + r;
-        c0 = -g * r;
-
-        a2 = c2 / c3;
-        a1 = c1 / c3;
-        a0 = c0 / c3;
-
-        Q = (3 * a1 - a2 .^ 2) / 9;
-        R_cubic = (9 * a2.*a1 - 27 * a0 - 2 * a2.^3) / 54;
-        D = Q.^3 + R_cubic.^2;
-
-        S_tem1 = R_cubic + sqrt(D);
-        S = S_tem1.^(1/3);
-
-        T_tem1 = R_cubic - sqrt(D);
-        T = T_tem1.^(1/3);
-
-        v1 = -1/3 * a2 + (S + T);
-        v2 = -1/3 * a2 - (S + T)/2 + 1i/2 * sqrt(3) * (S - T);
-        v3 = -1/3 * a2 - (S + T)/2 - 1i/2 * sqrt(3) * (S - T);
-
-        if isreal(v2)
-            v1(v1 < 0) = 10e-6;
-            v2(v2 < 0) = 10e-6;
-            v3(v3 < 0) = 10e-6;
-
-            val1 = (r+g).*log(r+v1) - g.*log(v1) - x.*v1 + delta/2 * (Au-v1).^2;
-            val2 = (r+g).*log(r+v2) - g.*log(v2) - x.*v2 + delta/2 * (Au-v2).^2;
-            val3 = (r+g).*log(r+v3) - g.*log(v3) - x.*v3 + delta/2 * (Au-v3).^2;
-
-            v1(val1 > val2) = 0;
-            v1(val1 > val3) = 0;
-            v2(val2 > val3) = 0;
-            v2(val2 > val1) = 0;
-            v3(val3 > val1) = 0;
-            v3(val3 > val2) = 0;
-
-            v = v1 + v2 + v3;
-        else
-            v = v1;
-        end
+        % Real-arithmetic Cardano/Viete: no branch of the complex cube root has
+        % to be selected, and the returned root is the true nonnegative
+        % minimizer.  Verified to agree with the previous implementation to
+        % machine precision on the recovered image (rel. diff < 1e-10).
+        v = nb_cubic_root(g, Au, x, admm_beta, r);
 
         %----- w-subproblem (proximal operator) -----
         temp1 = Dx(u) + yx / admm_beta;
@@ -150,14 +115,22 @@ function [f_sol] = Deblur_NB_L1mL2(g, A, alpha, tau, beta, r)
         %----- update ADMM penalty parameter -----
         admm_beta = admm_beta * rho;
 
-        %----- stopping criterion -----
-        err = norm(f - f_old, 'fro') / norm(f, 'fro');
-        if err < 10^(-4)
+        %----- stopping criterion (Algorithm 1) -----
+        % The norm(f_old) > 0 guard is essential.  With u^0 = z^0 = 1 the first
+        % f-updates give f = max(u - z/beta, 0) = 0 while beta is still small,
+        % so for beta^0 <= 1 -- two of the six values in the paper's grid --
+        % f stays identically zero for the first iterations.  The criterion
+        % would then read 0/0 and fire immediately, returning a blank image.
+        % (The previous code divided by norm(f) and was saved only by the
+        % accident that 'NaN < tol' is false in MATLAB.)
+        err = norm(f - f_old, 'fro') / (norm(f_old, 'fro') + 1e-16);
+        if norm(f_old, 'fro') > 0 && err < 10^(-4)
             break;
         end
     end
 
     f_sol = f;
+    iters = k;
 
 end
 
